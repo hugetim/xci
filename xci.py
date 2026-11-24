@@ -28,13 +28,14 @@ GPT-5 = 150), summarised by the posterior mean and 5th-95th percentiles, and che
 standards (no divergences, bulk ESS >= 400, R-hat <= 1.01).
 
 Usage:
-    python xci.py DATA_DIR OUT_DIR [--init-from PREVIOUS_OUT_DIR] [--chains 4 --cores 4 --tune 1500 --draws 2000]
+    python xci.py DATA_DIR OUT_DIR [--init-from PREVIOUS_OUT_DIR [--init-at-means]] [--chains 4 --cores 4 --tune 1500 --draws 2000]
 DATA_DIR is the epoch_capabilities_index/ folder of Epoch's benchmark data (https://epoch.ai/data/benchmark_data.zip);
 its processed_data_for_eci.csv is the fit input, used as is.
 Outputs in OUT_DIR: eci.csv (ECI by model), edi.csv (difficulty, slope, sigma_b and tau_b by benchmark, ECI scale
 except sigma_b), hyper.json, diagnostics.json, draws.npz.
 """
 import argparse
+import dataclasses
 import hashlib
 import json
 import time
@@ -51,12 +52,14 @@ from eci.bayesian import (  # noqa: E402
 
 from median_table import herm_a  # noqa: E402
 
-VERSION = "0.1"
+VERSION = "0.1.1"   # code version; the model is XCI v0.1 (likelihood unchanged since v0.1)
 ECI_PUBLIC_COMMIT = "e04929a"  # the eci-public commit this was checked against (setup.sh pins it)
 MU_FLOOR = 1e-12               # clip on the curve: mu in [MU_FLOOR, 1 - MU_FLOOR]
 LAMBDA = 1.0                   # capability noise scales with the slope: logit-scale sd alpha_b^LAMBDA tau_b
 S2_MAX, SHARP = 0.7, 50.0      # smooth cap on the variance factor: kappa >= 1 / 0.7 - 1 = 0.43 (table edge 0.3)
 MIN_ESS, MAX_RHAT = 400, 1.01  # Epoch's convergence standards (eci.bayesian _MIN_ESS, _MAX_RHAT)
+MAX_KAPPA_X0 = 150.0           # beyond this kappa x0, beta_logcdf_small's series loses accuracy: fails the checks
+MIN_ANCHOR_SPREAD = 1e-12      # Epoch's _MIN_ANCHOR_SPREAD
 HYPER = ["tau_alpha", "sigma_median", "tau_sigma", "delta", "tau_cap", "tau_spread"]
 DIAG_VARS = ["capability", "difficulty", "slope", "sigma", "tau_b"] + HYPER
 
@@ -134,14 +137,18 @@ def xci_model(df):
     return model
 
 
-def init_from_fit(fit_dir, model, eci_guess=None):
-    """Posterior means of an earlier fit (its draws.npz), on this model's raw scale, as starting points. draws.npz holds
-    ECI-scale draws plus each draw's map ECI = a + b * raw, so raw capability = (eci - a) / b, difficulty likewise,
-    raw slope = ECI-scale slope * b. The earlier fit may be of older data: a model it lacks starts at eci_guess[model]
-    (Epoch's published ECI) mapped to raw, else at the median capability; a benchmark it lacks starts at the median
-    difficulty and sigma, the mean log slope and tau_z = 0."""
+def init_from_fit(fit_dir, model, eci_guess=None, draw=None, verbose=True):
+    """Starting points from an earlier fit (its draws.npz) on this model's raw scale: posterior draw number `draw`, or
+    with draw=None the posterior means (medians for hyperparameters). draws.npz holds ECI-scale draws plus each draw's
+    map ECI = a + b * raw, so raw capability = (eci - a) / b, difficulty likewise, raw slope = ECI-scale slope * b. The
+    earlier fit may be of older data: a model it lacks starts at eci_guess[model] (Epoch's published ECI) mapped to
+    raw, else at the median capability; a benchmark it lacks starts at the median difficulty and sigma, the mean log
+    slope and tau_z = 0."""
     dr = np.load(Path(fit_dir) / "draws.npz")
-    a, b = dr["a"][:, None].astype(float), dr["b"][:, None].astype(float)
+    rows = slice(None) if draw is None else slice(draw, draw + 1)
+    red = (lambda x: x.mean(0)) if draw is None else (lambda x: x[0])
+    get = lambda k: dr[k][rows].astype(float)  # noqa: E731
+    a, b = get("a")[:, None], get("b")[:, None]
     src_m, src_b = list(dr["models"]), list(dr["benchmarks"])
     mods, bens = list(model.coords["model"]), list(model.coords["benchmark"])
     eci_guess = eci_guess or {}
@@ -150,29 +157,51 @@ def init_from_fit(fit_dir, model, eci_guess=None):
         pos = {n: i for i, n in enumerate(src)}
         return np.array([values[pos[n]] if n in pos else fill(n) for n in names], dtype=float)
 
-    cap_src = ((dr["eci"].astype(float) - a) / b).mean(0)
+    cap_src = red((get("eci") - a) / b)
     a_m, b_m = float(a.mean()), float(b.mean())
     cap = pick(cap_src, src_m, mods,
                lambda n: (eci_guess[n] - a_m) / b_m if n in eci_guess else float(np.median(cap_src)))
-    dif_src = ((dr["edi"].astype(float) - a) / b).mean(0)
-    lsl_src = np.log(dr["slope"].astype(float) * b).mean(0)
-    sig_src = dr["sigma"].astype(float).mean(0)
+    dif_src = red((get("edi") - a) / b)
+    lsl_src = red(np.log(get("slope") * b))
+    sig_src = red(get("sigma"))
     dif = pick(dif_src, src_b, bens, lambda n: float(np.median(dif_src)))
     lsl = pick(lsl_src, src_b, bens, lambda n: float(lsl_src.mean()))
     init = {"capability": cap, "difficulty": dif - dif.mean(), "log_slope": lsl - lsl.mean(),
             "sigma": pick(sig_src, src_b, bens, lambda n: float(np.median(sig_src)))}
     new_m, new_b = [m for m in mods if m not in set(src_m)], [x for x in bens if x not in set(src_b)]
-    if new_m or new_b:
+    if verbose and (new_m or new_b):
         print("init-from: %d new models (%s), %d new benchmarks (%s)" % (len(new_m), ", ".join(new_m[:5]), len(new_b),
                                                                          ", ".join(new_b[:5])), flush=True)
     for k in HYPER:
         if "hyper_" + k in dr.files:
-            init[k] = float(np.median(dr["hyper_" + k]))
+            init[k] = float(np.median(get("hyper_" + k)))
     if {"tau_b", "hyper_tau_cap", "hyper_tau_spread"} <= set(dr.files):
-        z = (np.log(dr["tau_b"].astype(float) / dr["hyper_tau_cap"].astype(float)[:, None])
-             / dr["hyper_tau_spread"].astype(float)[:, None]).mean(0)
+        z = red(np.log(get("tau_b") / get("hyper_tau_cap")[:, None]) / get("hyper_tau_spread")[:, None])
         init["tau_z"] = pick(z, src_b, bens, lambda n: 0.0)
     return init
+
+
+def per_chain_initial_point_func(model, fit_dir, eci_guess, free, jitter):
+    """A nutpie initial_point_func that starts each chain at its own posterior draw of an earlier fit, so that the
+    chains begin spread over the earlier posterior (and R-hat can flag a second mode) rather than all at its means.
+    nutpie calls it once per chain with a distinct seed derived from sample()'s seed (and again with a new seed if a
+    start is invalid); the seed picks the draw, so a run is reproducible. Returns the function and the list of draws
+    it picked."""
+    import threading
+    from pymc.initial_point import make_initial_point_fn
+    n_draws = len(np.load(Path(fit_dir) / "draws.npz")["a"])
+    names = [model.rvs_to_values[v].name for v in model.free_RVs]
+    lock, picked = threading.Lock(), []
+
+    def fn(seed):
+        with lock:
+            i = int(np.random.default_rng(seed).integers(n_draws))
+            picked.append(i)
+            init = {k: v for k, v in init_from_fit(fit_dir, model, eci_guess, draw=i, verbose=False).items() if k in free}
+            pt_ = make_initial_point_fn(model=model, overrides=init, jitter_rvs=jitter, return_transformed=True)(seed)
+            return np.concatenate([np.asarray(pt_[n], dtype=np.float64).ravel() for n in names])
+
+    return fn, picked
 
 
 def progress_logger(every, t_start):
@@ -216,7 +245,9 @@ def main():
     ap.add_argument("--progress-every", type=float, default=60.0, metavar="SECONDS",
                     help="print a progress line this often; 0 turns it off")
     ap.add_argument("--init-from", metavar="FIT_DIR",
-                    help="start chains at an earlier XCI fit's posterior means (its draws.npz)")
+                    help="start each chain at its own posterior draw of an earlier XCI fit (its draws.npz)")
+    ap.add_argument("--init-at-means", action="store_true",
+                    help="with --init-from, start every chain at the earlier fit's posterior means instead (v0.1)")
     args = ap.parse_args()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -233,7 +264,7 @@ def main():
     # where the curve saturates and the clip on mu flattens the gradient.
     free = {rv.name for rv in model.free_RVs}
     jitter = {model[v] for v in ("log_slope", "sigma", *HYPER) if v in free}
-    init = None
+    init, picked = None, None
     if args.init_from:
         pub = Path(args.data_dir) / "eci_scores.csv"  # Epoch's published ECI: starting points for models new since then
         guess = pd.read_csv(pub).set_index("Model").eci.to_dict() if pub.exists() else None
@@ -241,6 +272,9 @@ def main():
         jitter = {model[v] for v in HYPER if v not in init and v in free}
     t0 = time.time()
     compiled = nutpie.compile_pymc_model(model, jitter_rvs=jitter, initial_points=init)
+    if args.init_from and not args.init_at_means:
+        fn, picked = per_chain_initial_point_func(model, args.init_from, guess, free, jitter)
+        compiled = dataclasses.replace(compiled, initial_point_func=fn)
     t1 = time.time()
     trace = nutpie.sample(compiled, chains=args.chains, cores=args.cores, tune=args.tune, draws=args.draws,
                           seed=args.seed, adaptation="low_rank", target_accept=args.target_accept,
@@ -249,6 +283,28 @@ def main():
     post = trace.posterior.to_dataset() if hasattr(trace.posterior, "to_dataset") else trace.posterior
     stats = trace.sample_stats.to_dataset() if hasattr(trace.sample_stats, "to_dataset") else trace.sample_stats
 
+    def stack(name, dim=None):
+        x = post[name].stack(s=("chain", "draw"))
+        return (x.transpose("s", dim) if dim else x).values
+
+    C, D = stack("capability", "model"), stack("difficulty", "benchmark")
+    lo, hi = models.index(DEFAULT_ANCHOR_MODEL_LOW), models.index(DEFAULT_ANCHOR_MODEL_HIGH)
+    spread = C[:, hi] - C[:, lo]
+
+    # The series in beta_logcdf_small loses accuracy once kappa x0 is large (log error 87 at kappa 5,000, x0 0.083),
+    # so record its largest value over the 0% and 100% scores, across draws.
+    from eci.bayesian import _index_data
+    _, _, _, _, m_idx, b_idx = _index_data(df)
+    y = df.performance.to_numpy(float)
+    cens = (y <= 0) | (y >= 1)
+    mi, bi = m_idx[cens], b_idx[cens]
+    sl, sg, tb = (stack(v, "benchmark")[:, bi] for v in ("slope", "sigma", "tau_b"))
+    x0 = (lambda d: d / (1 + 2 * d))(stack("delta"))
+    kx0 = 0.0
+    for c in np.array_split(np.arange(len(x0)), max(1, len(x0) // 500)):
+        mu = np.clip(1 / (1 + np.exp(-sl[c] * (C[c][:, mi] - D[c][:, bi]))), MU_FLOOR, 1 - MU_FLOOR)
+        kx0 = max(kx0, float((kappa_formula(sg[c], sl[c], tb[c], mu) * x0[c][:, None]).max(initial=0.0)))
+
     summ = az.summary(post, var_names=DIAG_VARS, kind="diagnostics")
     div = int(stats["diverging"].sum())
     diag = dict(model=f"XCI v{VERSION}", divergences=div, min_ess_bulk=float(summ["ess_bulk"].min()),
@@ -256,22 +312,23 @@ def main():
                 worst_rhat=str(summ["r_hat"].idxmax()), worst_ess=str(summ["ess_bulk"].idxmin()),
                 chains=args.chains, tune=args.tune, draws=args.draws, adaptation="low_rank",
                 target_accept=args.target_accept, seed=args.seed, init_from=args.init_from,
+                init_draws=picked, max_kappa_x0=kx0, min_anchor_spread=float(spread.min()),
                 compile_s=round(t1 - t0, 1), sample_s=round(t2 - t1, 1),
                 n_scores=len(df), n_models=len(models), n_benchmarks=len(benches),
                 processed_sha256=hashlib.sha256(src.read_bytes()).hexdigest(),
                 sbeta=True, median_centre=True, var_match=LAMBDA, tau_bench=True, mu_floor=MU_FLOOR,
                 delta_prior="halfnormal0.05", eci_public_commit=ECI_PUBLIC_COMMIT,
                 fitted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    diag["passes_epoch_checks"] = bool(div == 0 and diag["min_ess_bulk"] >= MIN_ESS and diag["max_rhat"] <= MAX_RHAT)
+    diag["passes_epoch_checks"] = bool(div == 0 and diag["min_ess_bulk"] >= MIN_ESS and diag["max_rhat"] <= MAX_RHAT
+                                       and kx0 <= MAX_KAPPA_X0)
     print(json.dumps(diag, indent=1), flush=True)
     (out / "diagnostics.json").write_text(json.dumps(diag, indent=1))
+    bad = ~(spread > MIN_ANCHOR_SPREAD)  # also catches NaN
+    if bad.any():  # as in Epoch's _anchor_transform: the per-draw ECI map would flip or blow up
+        raise ValueError(f"{bad.sum()} of {spread.size} posterior draws place {DEFAULT_ANCHOR_MODEL_HIGH} at or below "
+                         f"{DEFAULT_ANCHOR_MODEL_LOW}, defining no scale")
 
-    def stack(name, dim):
-        return post[name].stack(s=("chain", "draw")).transpose("s", dim).values
-
-    C, D = stack("capability", "model"), stack("difficulty", "benchmark")
-    lo, hi = models.index(DEFAULT_ANCHOR_MODEL_LOW), models.index(DEFAULT_ANCHOR_MODEL_HIGH)
-    b = (DEFAULT_ANCHOR_ECI_HIGH - DEFAULT_ANCHOR_ECI_LOW) / (C[:, hi] - C[:, lo])
+    b = (DEFAULT_ANCHOR_ECI_HIGH - DEFAULT_ANCHOR_ECI_LOW) / spread
     a = DEFAULT_ANCHOR_ECI_LOW - b * C[:, lo]
     s = dict(a=a, b=b, eci=a[:, None] + b[:, None] * C, edi=a[:, None] + b[:, None] * D,
              slope=stack("slope", "benchmark") / b[:, None], sigma=stack("sigma", "benchmark"),

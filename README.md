@@ -25,7 +25,7 @@ curl -sSfLO https://epoch.ai/data/benchmark_data.zip && unzip -q benchmark_data.
 python xci.py data/epoch_capabilities_index out
 ```
 
-A fit takes about 20 minutes on 4 cores. To refit new data, `--init-from` starts the chains at an earlier fit's posterior means.
+A fit takes about 20 minutes on 4 cores. To refit new data, `--init-from` starts each chain at its own posterior draw of an earlier fit.
 
 Outputs in `out/`: `eci.csv` (ECI by model, with 90% intervals), `edi.csv` (difficulty, slope, σ_b and τ_b by benchmark), `hyper.json`, `diagnostics.json` (convergence against Epoch's checks and the SHA-256 of the fit input) and `draws.npz` (posterior draws).
 

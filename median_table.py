@@ -5,7 +5,9 @@ Solving for the root inside the model at every gradient evaluation would be slow
 z = logit(a / kappa) is smooth in u = logit(mu) and w = log(kappa). The exact roots (solve_median) are computed on a
 fine (u, w) grid, a bicubic spline through them gives z and its derivatives at the knots, and herm_a interpolates
 between knots by bicubic Hermite interpolation. That is plain array arithmetic, so it runs inside PyTensor's compiled
-graph and PyTensor differentiates it exactly. The table matches the exact roots to within 3e-9 in a.
+graph and PyTensor differentiates it exactly. The table matches the exact roots to within 3e-9 in a over the range
+the fit uses (kappa 0.43 to 1,400, |logit(mu)| <= 12; XCI v0.1's posterior draws use kappa 0.43 to 1,332). Over the
+whole table the error is up to 2e-7 in a, and up to 1e-4 relative in 1 - mu for logit(mu) > 15.
 
 The table spans logit(mu) to +-27.7, which covers XCI v0.1's clip on mu (1e-12, at logit +-27.63), and kappa from 0.3
 to 5,000. It is built once per process (a few seconds).
